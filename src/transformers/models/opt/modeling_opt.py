@@ -14,13 +14,14 @@
 # limitations under the License.
 """ PyTorch OPT model."""
 import random
+from re import A, S
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
+import copy
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from ...modeling_utils import PreTrainedModel
@@ -113,6 +114,22 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
 
         return super().forward(positions + self.offset)
 
+# XGX: Modulized the BMM, Softmax and Add
+
+
+class BMM(nn.Module):
+    def forward(self, x, y):
+        return torch.bmm(x, y)
+
+
+class Softmax(nn.Module):
+    def forward(self, x):
+        x_dtype = x.dtype
+        return nn.functional.softmax(x, dim=-1, dtype=torch.float32).to(x_dtype)
+
+class Add(nn.Module):
+    def forward(self, x, y):
+        return x + y
 
 class OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -143,6 +160,10 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        self.qk_bmm = BMM()
+        self.att_val_bmm = BMM()
+        self.att_softmax = Softmax()
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -202,7 +223,8 @@ class OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        # XGX: BMM
+        attn_weights = self.qk_bmm(query_states, key_states.transpose(1, 2))
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -221,10 +243,12 @@ class OPTAttention(nn.Module):
             dtype_attn_weights = attn_weights.dtype
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if dtype_attn_weights == torch.float16:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # if dtype_attn_weights == torch.float16:
+        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
+        # else:
+        #     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # XGX: Softmax
+        self.att_softmax(attn_weights)
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -247,7 +271,8 @@ class OPTAttention(nn.Module):
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        attn_output = torch.bmm(attn_probs, value_states)
+        # XGX: BMM
+        attn_output = self.att_val_bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -279,12 +304,15 @@ class OPTDecoderLayer(nn.Module):
         )
         self.do_layer_norm_before = config.do_layer_norm_before
         self.dropout = config.dropout
-        self.activation_fn = ACT2FN[config.activation_function]
+        # XGX: self.activation_fn = ACT2FN[config.activation_function]
+        self.activation_fn = copy.deepcopy(ACT2FN[config.activation_function])
 
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim)
         self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.add_after_attention = Add()
+        self.add_after_ffn = Add()
 
     def forward(
         self,
@@ -326,7 +354,8 @@ class OPTDecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
+        # hidden_states = residual + hidden_states
+        hidden_states = self.add_after_attention(residual, hidden_states)
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -347,7 +376,8 @@ class OPTDecoderLayer(nn.Module):
         hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
-        hidden_states = (residual + hidden_states).view(hidden_states_shape)
+        # hidden_states = (residual + hidden_states).view(hidden_states_shape)
+        hidden_states = self.add_after_ffn(residual, hidden_states).view(hidden_states_shape)
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
