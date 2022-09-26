@@ -123,16 +123,17 @@ class BMM(nn.Module):
 
 
 class Softmax(nn.Module):
-    def forward(self, x):
-        x_dtype = x.dtype
-        if x_dtype == torch.float16:
-            return nn.functional.softmax(x, dim=-1, dtype=torch.float32).to(x_dtype)
+    def forward(self, x, dtype=None):
+        if dtype == torch.float16:
+            return nn.functional.softmax(x, dim=-1, dtype=torch.float32).to(dtype)
         else:
             return nn.functional.softmax(x, dim=-1)
+
 
 class Add(nn.Module):
     def forward(self, x, y):
         return x + y
+
 
 class OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -227,6 +228,7 @@ class OPTAttention(nn.Module):
 
         src_len = key_states.size(1)
         # XGX: BMM
+        # attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
         attn_weights = self.qk_bmm(query_states, key_states.transpose(1, 2))
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
@@ -246,12 +248,12 @@ class OPTAttention(nn.Module):
             dtype_attn_weights = attn_weights.dtype
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
+        # XGX: Softmax
         # if dtype_attn_weights == torch.float16:
         #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
         # else:
         #     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        # XGX: Softmax
-        self.att_softmax(attn_weights)
+        attn_weights = self.att_softmax(attn_weights, dtype_attn_weights)
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -275,6 +277,7 @@ class OPTAttention(nn.Module):
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
         # XGX: BMM
+        # attn_output = torch.bmm(attn_probs, value_states)
         attn_output = self.att_val_bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
