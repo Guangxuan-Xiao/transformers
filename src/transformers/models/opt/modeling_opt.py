@@ -125,7 +125,10 @@ class BMM(nn.Module):
 class Softmax(nn.Module):
     def forward(self, x):
         x_dtype = x.dtype
-        return nn.functional.softmax(x, dim=-1, dtype=torch.float32).to(x_dtype)
+        if x_dtype == torch.float16:
+            return nn.functional.softmax(x, dim=-1, dtype=torch.float32).to(x_dtype)
+        else:
+            return nn.functional.softmax(x, dim=-1)
 
 class Add(nn.Module):
     def forward(self, x, y):
